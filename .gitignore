@@ -1,5 +1,6 @@
 config/config.yaml
 downloads/
+download_test/
 *.pyc
 __pycache__/
 .venv/

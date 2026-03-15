@@ -37,6 +37,7 @@ def _get_cookie() -> str:
 
 
 def _get_pdir_id(headers: dict, api_base: str, dir_name: str) -> str:
+    """获取或创建目录，返回其 fid；dir_name 为空则返回 "0"（根目录）。"""
     pdir_id = "0"
     if not dir_name:
         return pdir_id
@@ -45,10 +46,11 @@ def _get_pdir_id(headers: dict, api_base: str, dir_name: str) -> str:
         "pr": "ucpro",
         "pro": False,
         "pdir_fid": pdir_id,
-        "dir_name": dir_name,
+        "file_name": dir_name,
     }
     try:
-        r = requests.post(create_dir_url, json=create_payload, headers=headers, timeout=30)
+        h = {**headers, "Content-Type": "application/json", "Accept": "application/json, text/plain, */*"}
+        r = requests.post(create_dir_url, json=create_payload, headers=h, params={"pr": "ucpro", "fr": "pc"}, timeout=30)
         if r.status_code == 200:
             data = r.json()
             if data.get("data", {}).get("fid"):
@@ -56,6 +58,30 @@ def _get_pdir_id(headers: dict, api_base: str, dir_name: str) -> str:
     except Exception:
         pass
     return pdir_id
+
+
+def _create_folder_under(headers: dict, api_base: str, parent_fid: str, dir_name: str) -> str:
+    """在指定父目录下创建文件夹，返回新文件夹 fid。"""
+    create_dir_url = f"{api_base}/file"
+    create_payload = {
+        "pr": "ucpro",
+        "pro": False,
+        "pdir_fid": parent_fid,
+        "file_name": dir_name,
+    }
+    h = {**headers, "Content-Type": "application/json", "Accept": "application/json, text/plain, */*"}
+    r = requests.post(create_dir_url, json=create_payload, headers=h, params={"pr": "ucpro", "fr": "pc"}, timeout=30)
+    if r.status_code == 401:
+        raise RuntimeError(
+            "创建夸克文件夹失败: 未登录(401)。请按 docs/夸克Cookie获取.md 重新登录夸克网盘并复制最新 Cookie 到 config/config.yaml 的 quark.cookie"
+        )
+    if r.status_code != 200:
+        raise RuntimeError(f"创建夸克文件夹失败: HTTP {r.status_code}, {r.text[:300]}")
+    data = r.json()
+    fid = (data.get("data") or {}).get("fid")
+    if not fid:
+        raise RuntimeError(f"创建夸克文件夹未返回 fid: {data}")
+    return fid
 
 
 def _upload_simple(local_path: Path, pdir_id: str, headers: dict, api_base: str) -> str:
@@ -260,17 +286,34 @@ def _upload_chunked(local_path: Path, pdir_id: str, headers: dict, api_base: str
     return _upload_finish(pre, headers, api_base)
 
 
-def upload_file(local_path: Path, remote_dir: Optional[str] = None) -> str:
+def create_batch_folder(batch_name: str) -> str:
     """
-    上传本地文件到夸克网盘，返回网盘中的文件 id（用于后续分享）。
-    小于 1MB 整块上传，大于 1MB 自动分片上传。
+    在配置的上传目录下创建一批次文件夹，返回该文件夹 fid。
+    用于批量任务：多文件上传到同一文件夹后对该 fid 生成一个分享链接。
     """
     cookie = _get_cookie()
     cfg = load_config().get("quark", {})
-    dir_name = remote_dir if remote_dir is not None else cfg.get("upload_dir", "")
     api_base = (cfg.get("api_base") or "https://drive.quark.cn/1/clouddrive").rstrip("/")
     headers = {**DEFAULT_HEADERS, "Cookie": cookie}
-    pdir_id = _get_pdir_id(headers, api_base, dir_name)
+    base_dir = (cfg.get("upload_dir") or "").strip()
+    parent_fid = _get_pdir_id(headers, api_base, base_dir)
+    return _create_folder_under(headers, api_base, parent_fid, batch_name)
+
+
+def upload_file(local_path: Path, remote_dir: Optional[str] = None, pdir_id: Optional[str] = None) -> str:
+    """
+    上传本地文件到夸克网盘，返回网盘中的文件 id（用于后续分享）。
+    pdir_id: 若指定，则上传到该 fid 对应的文件夹；否则用 remote_dir 或配置的 upload_dir。
+    """
+    cookie = _get_cookie()
+    cfg = load_config().get("quark", {})
+    api_base = (cfg.get("api_base") or "https://drive.quark.cn/1/clouddrive").rstrip("/")
+    headers = {**DEFAULT_HEADERS, "Cookie": cookie}
+    if pdir_id is not None:
+        pdir_id = str(pdir_id)
+    else:
+        dir_name = remote_dir if remote_dir is not None else cfg.get("upload_dir", "")
+        pdir_id = _get_pdir_id(headers, api_base, dir_name)
     size = local_path.stat().st_size
 
     # 小文件可走整块上传；若整块接口 404 则统一走分片流程（pre -> hash/parts -> commit -> finish）

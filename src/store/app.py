@@ -13,7 +13,7 @@ from pydantic import BaseModel
 
 from src.common.config import load_config
 from src.download.runner import get_video_info
-from src.pipeline.task import run_pipeline
+from src.pipeline.task import run_batch_pipeline, run_pipeline
 
 # 内存任务表：task_id -> { status, share_url?, error? }（可后续改为 Redis 做多机负载均衡）
 _task_store: dict = {}
@@ -78,8 +78,28 @@ class QuoteOut(BaseModel):
     error: str | None = None
 
 
+class QuoteBatchIn(BaseModel):
+    video_urls: list[str]
+
+
+class QuoteItemOut(BaseModel):
+    ok: bool
+    title: str
+    duration_text: str
+    resolution_text: str
+    price: float
+    error: str | None = None
+
+
+class QuoteBatchOut(BaseModel):
+    items: list[QuoteItemOut]
+    total_price: float
+    count: int
+
+
 class OrderIn(BaseModel):
-    video_url: str
+    video_url: str | None = None  # 单条时可用
+    video_urls: list[str] | None = None  # 多条时使用，与 video_url 二选一
 
 
 class OrderOut(BaseModel):
@@ -139,7 +159,35 @@ def quote(req: QuoteIn) -> QuoteOut:
     )
 
 
-def _run_task(task_id: str, video_url: str) -> None:
+@app.post("/api/quote_batch", response_model=QuoteBatchOut)
+def quote_batch(req: QuoteBatchIn) -> QuoteBatchOut:
+    """批量报价：多条链接统一返回每条信息与总价。"""
+    urls = [u.strip() for u in (req.video_urls or []) if u.strip()]
+    if not urls:
+        raise HTTPException(status_code=400, detail="请填写至少一条视频链接")
+    items: list[QuoteItemOut] = []
+    total = 0.0
+    for url in urls:
+        info = get_video_info(url)
+        if not info.get("ok"):
+            items.append(QuoteItemOut(ok=False, title="", duration_text="", resolution_text="", price=0, error=info.get("error", "解析失败")))
+            continue
+        dur = info.get("duration") or 0
+        h = info.get("height") or 0
+        price, _ = _calc_price(dur, h)
+        total += price
+        items.append(QuoteItemOut(
+            ok=True,
+            title=(info.get("title") or "未命名")[:50],
+            duration_text=_format_duration(dur),
+            resolution_text=f"{h}p" if h else "未知",
+            price=round(price, 2),
+            error=None,
+        ))
+    return QuoteBatchOut(items=items, total_price=round(total, 2), count=len(items))
+
+
+def _run_task(task_id: str, video_urls: list[str]) -> None:
     def progress_step(msg: str) -> None:
         with _store_lock:
             _task_store[task_id]["step"] = msg
@@ -148,12 +196,15 @@ def _run_task(task_id: str, video_url: str) -> None:
         _task_store[task_id]["status"] = "processing"
         _task_store[task_id]["step"] = "准备中…"
     try:
-        result = run_pipeline(
-            video_url,
-            skip_quark=False,
-            prefer_small_format=False,
-            progress_callback=progress_step,
-        )
+        if len(video_urls) == 1:
+            result = run_pipeline(
+                video_urls[0],
+                skip_quark=False,
+                prefer_small_format=False,
+                progress_callback=progress_step,
+            )
+        else:
+            result = run_batch_pipeline(task_id, video_urls, progress_callback=progress_step)
         with _store_lock:
             if result.get("success"):
                 _task_store[task_id]["status"] = "success"
@@ -172,14 +223,18 @@ def _run_task(task_id: str, video_url: str) -> None:
 
 @app.post("/api/order", response_model=OrderOut)
 def create_order(req: OrderIn) -> OrderOut:
-    """提交订单，立即返回 task_id，后台处理；前端轮询 GET /api/order/{task_id} 获取结果。"""
-    url = (req.video_url or "").strip()
-    if not url:
-        raise HTTPException(status_code=400, detail="请填写视频链接")
+    """提交订单（单条或批量），立即返回 task_id；批量时下载到同一文件夹、上传到夸克同一文件夹、生成一个分享链接。"""
+    urls: list[str] = []
+    if req.video_urls:
+        urls = [u.strip() for u in req.video_urls if u.strip()]
+    if req.video_url and not urls:
+        urls = [req.video_url.strip()]
+    if not urls:
+        raise HTTPException(status_code=400, detail="请填写至少一条视频链接")
     task_id = str(uuid.uuid4())
     with _store_lock:
         _task_store[task_id] = {"status": "pending", "step": None, "share_url": None, "error": None}
-    t = threading.Thread(target=_run_task, args=(task_id, url), daemon=True)
+    t = threading.Thread(target=_run_task, args=(task_id, urls), daemon=True)
     t.start()
     return OrderOut(task_id=task_id)
 
@@ -285,10 +340,16 @@ _INDEX_HTML = """<!DOCTYPE html>
     .btn-secondary:hover { background: #3a3a45; }
     .row { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.75rem; }
     .row .btn { flex: 1; min-width: 120px; }
+    textarea { width: 100%; min-height: 100px; padding: 0.85rem 1rem; border: 1px solid var(--border); border-radius: 10px; background: var(--bg); color: var(--text); font-size: 14px; resize: vertical; font-family: inherit; }
+    textarea::placeholder { color: var(--muted); }
+    textarea:focus { outline: none; border-color: var(--accent); }
     .quote-card .title { font-weight: 600; margin-bottom: 0.4rem; }
     .quote-card .meta { color: var(--muted); font-size: 0.9rem; margin-bottom: 0.4rem; }
     .quote-card .price { font-size: 1.35rem; font-weight: 700; color: var(--accent); margin: 0.5rem 0; }
     .quote-card .breakdown { font-size: 0.8rem; color: var(--muted); }
+    .quote-batch-list { max-height: 200px; overflow-y: auto; margin: 0.5rem 0; font-size: 0.85rem; }
+    .quote-batch-list li { padding: 0.35rem 0; border-bottom: 1px solid var(--border); list-style: none; }
+    .quote-batch-total { font-weight: 700; color: var(--accent); margin-top: 0.5rem; }
     .result-card .status { font-weight: 600; margin-bottom: 0.5rem; }
     .result-card .status.processing { color: var(--accent); }
     .result-card .status.success { color: var(--success); }
@@ -315,22 +376,21 @@ _INDEX_HTML = """<!DOCTYPE html>
 <body>
   <div class="container">
     <h1>卖家工作台</h1>
-    <p class="sub">输入客户要的视频链接 → 查价报给客户 → 客户下单后点「提交并处理」→ 服务器自动解析、下载、上传夸克并生成链接，复制发给客户即可（支持手机操作）</p>
+    <p class="sub">支持多条链接：每行一条，统一估价；批量时下载到同一文件夹并上传到夸克同一文件夹，生成一个链接发给客户</p>
 
     <div class="card">
-      <label for="video_url">客户视频链接（B站 / 抖音 / 等）</label>
-      <input type="url" id="video_url" placeholder="https://www.bilibili.com/video/..." autocomplete="off">
+      <label for="video_urls">客户视频链接（每行一条，B站 / 抖音 / 等）</label>
+      <textarea id="video_urls" placeholder="https://www.bilibili.com/video/...&#10;https://...&#10;（可粘贴多条）" autocomplete="off"></textarea>
       <div class="row">
         <button type="button" class="btn btn-primary" id="btnQuote">查询价格（报给客户）</button>
-        <button type="button" class="btn btn-secondary" id="btnOrder">提交并处理（下载→上传夸克→生成链接）</button>
+        <button type="button" class="btn btn-secondary" id="btnOrder">提交并处理（下载→上传夸克→生成一个链接）</button>
       </div>
     </div>
 
     <div id="outQuote" class="card quote-card hidden">
-      <div class="title" id="quoteTitle"></div>
-      <div class="meta" id="quoteMeta"></div>
-      <div class="price" id="quotePrice"></div>
-      <div class="breakdown" id="quoteBreakdown"></div>
+      <div class="title" id="quoteTitle">批量报价</div>
+      <ul class="quote-batch-list" id="quoteBatchList"></ul>
+      <div class="quote-batch-total" id="quoteTotal"></div>
       <div class="err-msg hidden" id="quoteErr"></div>
     </div>
 
@@ -348,28 +408,33 @@ _INDEX_HTML = """<!DOCTYPE html>
   </div>
 
   <script>
-    var videoUrl = '';
-    var lastQuote = null;
+    function getUrls() {
+      var text = document.getElementById('video_urls').value;
+      return text.split(/[\\r\\n]+/).map(function(s) { return s.trim(); }).filter(Boolean);
+    }
 
-    function showQuote(ok, data) {
+    function showQuoteBatch(data) {
       var out = document.getElementById('outQuote');
       out.classList.remove('hidden');
       document.getElementById('quoteErr').classList.add('hidden');
-      if (!ok) {
-        document.getElementById('quoteTitle').textContent = '';
-        document.getElementById('quoteMeta').textContent = '';
-        document.getElementById('quotePrice').textContent = '';
-        document.getElementById('quoteBreakdown').textContent = '';
-        document.getElementById('quoteErr').textContent = data.error || '解析失败';
-        document.getElementById('quoteErr').classList.remove('hidden');
-        lastQuote = null;
+      var list = document.getElementById('quoteBatchList');
+      list.innerHTML = '';
+      if (!data || !data.items || data.items.length === 0) {
+        document.getElementById('quoteTitle').textContent = '未解析到有效链接';
+        document.getElementById('quoteTotal').textContent = '';
         return;
       }
-      lastQuote = data;
-      document.getElementById('quoteTitle').textContent = data.title || '未命名视频';
-      document.getElementById('quoteMeta').textContent = data.duration_text + ' · ' + data.resolution_text;
-      document.getElementById('quotePrice').textContent = '¥ ' + data.price.toFixed(2);
-      document.getElementById('quoteBreakdown').textContent = (data.price_breakdown || []).join('；');
+      document.getElementById('quoteTitle').textContent = '共 ' + data.count + ' 条，统一报价';
+      data.items.forEach(function(it, i) {
+        var li = document.createElement('li');
+        if (it.ok) {
+          li.textContent = (i + 1) + '. ' + (it.title || '未命名') + ' — ' + it.duration_text + ' · ' + it.resolution_text + ' — ¥' + it.price.toFixed(2);
+        } else {
+          li.innerHTML = (i + 1) + '. <span style="color:var(--err)">' + (it.error || '解析失败') + '</span>';
+        }
+        list.appendChild(li);
+      });
+      document.getElementById('quoteTotal').textContent = '合计：¥ ' + (data.total_price || 0).toFixed(2);
     }
 
     function showOrderPolling(taskId) {
@@ -392,7 +457,7 @@ _INDEX_HTML = """<!DOCTYPE html>
             if (d.status === 'success') {
               document.getElementById('outOrder').classList.add('hidden');
               document.getElementById('outResult').classList.remove('hidden');
-              document.getElementById('resultStatus').textContent = '处理完成，请复制下方夸克链接发给客户';
+              document.getElementById('resultStatus').textContent = '处理完成，下方为夸克文件夹链接（内含本批全部视频），复制发给客户即可';
               document.getElementById('resultStatus').className = 'status success';
               document.getElementById('resultLink').textContent = d.share_url || '';
               document.getElementById('resultLink').dataset.url = d.share_url || '';
@@ -418,30 +483,28 @@ _INDEX_HTML = """<!DOCTYPE html>
     }
 
     document.getElementById('btnQuote').onclick = function() {
-      var url = document.getElementById('video_url').value.trim();
-      if (!url) { alert('请先输入视频链接'); return; }
-      videoUrl = url;
+      var urls = getUrls();
+      if (!urls.length) { alert('请先输入至少一条视频链接（每行一条）'); return; }
       this.disabled = true;
-      fetch('/api/quote', {
+      fetch('/api/quote_batch', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ video_url: url })
+        body: JSON.stringify({ video_urls: urls })
       })
         .then(function(r) { return r.json(); })
-        .then(function(d) { showQuote(d.ok, d); })
-        .catch(function(e) { showQuote(false, { error: e.message || '网络错误' }); })
+        .then(function(d) { showQuoteBatch(d); })
+        .catch(function(e) { showQuoteBatch({ items: [], total_price: 0, count: 0 }); document.getElementById('quoteErr').textContent = e.message || '网络错误'; document.getElementById('quoteErr').classList.remove('hidden'); })
         .finally(function() { document.getElementById('btnQuote').disabled = false; });
     };
 
     document.getElementById('btnOrder').onclick = function() {
-      var url = document.getElementById('video_url').value.trim();
-      if (!url) { alert('请先输入视频链接'); return; }
-      videoUrl = url;
+      var urls = getUrls();
+      if (!urls.length) { alert('请先输入至少一条视频链接（每行一条）'); return; }
       this.disabled = true;
       fetch('/api/order', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ video_url: url })
+        body: JSON.stringify({ video_urls: urls })
       })
         .then(function(r) { return r.json(); })
         .then(function(d) {

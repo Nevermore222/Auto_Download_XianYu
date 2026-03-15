@@ -45,11 +45,11 @@ def download_video(
     out_filename: Optional[str] = None,
     prefer_small_format: bool = False,
     max_duration_seconds: Optional[int] = None,
+    batch_index: Optional[int] = None,
 ) -> Path:
     """
     下载视频到本地，返回下载好的文件路径。
-    prefer_small_format: 使用较低画质以控制体积。
-    max_duration_seconds: 仅下载前 N 秒（用于控制体积，如 30 秒内必小于 8MB）。
+    batch_index: 批量下载时传入序号（从 1 起），用于生成唯一文件名，避免同目录下多条链接因标题相同而互相覆盖。
     """
     cfg = load_config().get("download", {})
     base_dir = output_dir or get_download_dir()
@@ -58,10 +58,11 @@ def download_video(
     if out_filename:
         outtmpl = str(Path(base_dir) / out_filename)
     else:
+        suffix = f"_{batch_index}" if batch_index is not None else ""
         if max_duration_seconds:
-            base_name = f"%(title).80s_partial_{max_duration_seconds}s.%(ext)s"
+            base_name = f"%(title).80s{suffix}_partial_{max_duration_seconds}s.%(ext)s"
         else:
-            base_name = "%(title).100s.%(ext)s"
+            base_name = f"%(title).80s{suffix}.%(ext)s"
         outtmpl = str(Path(base_dir) / base_name)
 
     format_str = cfg.get("format", "bestvideo+bestaudio/best")

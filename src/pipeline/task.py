@@ -1,12 +1,18 @@
 """
 单任务流水线：解析视频链接 → 下载 → 上传夸克 → 返回分享链接。
-支持 progress_callback 上报当前步骤，便于前端显示进度日志。
+支持单条与批量；批量时下载到同一文件夹、上传到夸克同一文件夹、生成一个分享链接。
 """
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, List, Optional
 
+from src.common.config import get_download_dir
 from src.download.runner import download_video
-from src.quark.client import upload_and_share
+from src.quark.client import (
+    create_batch_folder,
+    create_share_link,
+    upload_and_share,
+    upload_file,
+)
 
 
 def run_pipeline(
@@ -61,3 +67,55 @@ def run_pipeline(
             "local_path": str(local_path),
             "error": f"上传夸克失败: {e}",
         }
+
+
+def run_batch_pipeline(
+    task_id: str,
+    video_urls: List[str],
+    progress_callback: Optional[Callable[[str], None]] = None,
+) -> dict:
+    """
+    批量流程：多条链接下载到同一本地文件夹 → 在夸克创建同一批次文件夹 →
+    全部上传到该文件夹 → 对该文件夹生成一个分享链接。
+    返回: { "success": bool, "share_url": str, "error": str|None }
+    """
+    def log(msg: str) -> None:
+        if progress_callback:
+            progress_callback(msg)
+
+    urls = [u.strip() for u in video_urls if u.strip()]
+    if not urls:
+        return {"success": False, "share_url": "", "error": "没有有效的视频链接"}
+
+    base_dir = Path(get_download_dir())
+    batch_dir = base_dir / f"batch_{task_id}"
+    batch_dir.mkdir(parents=True, exist_ok=True)
+    batch_name = f"视频批次_{task_id[:8]}"
+
+    downloaded: List[Path] = []
+    try:
+        for i, url in enumerate(urls):
+            log(f"正在下载第 {i + 1}/{len(urls)} 条…")
+            path = download_video(
+                url,
+                output_dir=str(batch_dir),
+                prefer_small_format=False,
+                batch_index=i + 1,
+            )
+            downloaded.append(path)
+            log(f"第 {i + 1} 条下载完成")
+    except Exception as e:
+        return {"success": False, "share_url": "", "error": f"下载失败: {e}"}
+
+    try:
+        log("正在创建夸克文件夹…")
+        folder_fid = create_batch_folder(batch_name)
+        log(f"正在上传到夸克（共 {len(downloaded)} 个文件）…")
+        for i, path in enumerate(downloaded):
+            log(f"正在上传第 {i + 1}/{len(downloaded)} 个文件…")
+            upload_file(path, pdir_id=folder_fid)
+        log("正在生成分享链接…")
+        share_url = create_share_link(folder_fid, title=batch_name)
+        return {"success": True, "share_url": share_url, "error": None}
+    except Exception as e:
+        return {"success": False, "share_url": "", "error": f"上传或分享失败: {e}"}
