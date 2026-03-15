@@ -1,0 +1,12 @@
+config/config.yaml
+downloads/
+*.pyc
+__pycache__/
+.venv/
+venv/
+.env
+*.log
+desktop_app/redeem_state.json
+dist/
+build/
+*.egg-info/

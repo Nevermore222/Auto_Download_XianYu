@@ -1,0 +1,13 @@
+# 视频下载
+yt-dlp>=2024.1.1
+
+# Web 与 API
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+
+# 配置与工具
+pyyaml>=6.0
+requests>=2.31.0
+
+# 可选：闲鱼/夸克第三方库（按需安装）
+# selenium  # 若用浏览器自动获取夸克 Cookie

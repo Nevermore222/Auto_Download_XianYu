@@ -1,0 +1,16 @@
+{
+  "default_save_dir": "",
+  "code_secret": "xuwh",
+  "pricing": {
+    "duration": [
+      { "max_minutes": 1, "price": 0.5 },
+      { "max_minutes": 5, "price": 1.5 },
+      { "max_minutes": 30, "price": 3 },
+      { "max_minutes": 9999, "price": 6 }
+    ],
+    "resolution_add": [
+      { "min_height": 721, "add": 0.5 },
+      { "min_height": 1081, "add": 1 }
+    ]
+  }
+}

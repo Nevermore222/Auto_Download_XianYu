@@ -1,0 +1,47 @@
+# 复制为 config.yaml 并填写实际值
+
+# 下载设置
+download:
+  # 临时下载目录（绝对路径或相对项目根目录）
+  output_dir: "./downloads"
+  # 下载格式：best 或 bestvideo+bestaudio
+  format: "bestvideo+bestaudio/best"
+  merge_format: "mp4"
+  # 可选：按站点传参给 yt-dlp（如 B 站）。B 站水印多为压进画面，下载即带水印；若 yt-dlp 后续支持可在此配置
+  # extractor_args:
+  #   bilibili: {}
+
+# 夸克网盘（见 docs/夸克Cookie获取.md）
+quark:
+  # 从浏览器复制的完整 Cookie 字符串
+  cookie: ""
+  # 上传到此目录名（网盘内），空则根目录
+  upload_dir: "视频代下载"
+
+# 助手服务（供闲鱼侧或人工调用）
+assistant:
+  host: "0.0.0.0"
+  port: 8765
+  # 与下载系统通信的 base_url（同机可填 http://127.0.0.1:8766）
+  system_base_url: "http://127.0.0.1:8766"
+
+# 下载系统（执行下载+上传的服务）
+system:
+  host: "0.0.0.0"
+  port: 8766
+
+# 客户自助网站（发给闲鱼客户，输入链接查价并下单）
+store:
+  host: "0.0.0.0"
+  port: 8770
+  # 定价规则（单位：元）
+  # 按时长：不超过 N 分钟为对应价格
+  pricing:
+    duration:
+      - { max_minutes: 1, price: 0.5 }
+      - { max_minutes: 5, price: 1.5 }
+      - { max_minutes: 30, price: 3 }
+      - { max_minutes: 9999, price: 6 }
+    resolution_add:
+      - { min_height: 721, add: 0.5 }
+      - { min_height: 1081, add: 1 }

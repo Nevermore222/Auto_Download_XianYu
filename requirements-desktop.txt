@@ -1,0 +1,3 @@
+# 桌面端依赖（在项目根目录执行 pip install -r requirements-desktop.txt）
+customtkinter>=5.2.0
+yt-dlp>=2024.1.1
