@@ -2,6 +2,7 @@
 单任务流水线：解析视频链接 → 下载 → 上传夸克 → 返回分享链接。
 支持单条与批量；批量时下载到同一文件夹、上传到夸克同一文件夹、生成一个分享链接。
 """
+import re
 from pathlib import Path
 from typing import Callable, List, Optional
 
@@ -13,6 +14,24 @@ from src.quark.client import (
     upload_and_share,
     upload_file,
 )
+
+_INVALID_FS_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1F]+')
+
+
+def _safe_folder_name(name: str) -> str:
+    name = (name or "").strip()
+    if not name:
+        return ""
+    name = _INVALID_FS_CHARS.sub("_", name)
+    name = re.sub(r"\s+", " ", name).strip(" ._")
+    return name[:80]
+
+
+def _ts() -> str:
+    from datetime import datetime
+
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
 
 
 def run_pipeline(
@@ -72,6 +91,7 @@ def run_pipeline(
 def run_batch_pipeline(
     task_id: str,
     video_urls: List[str],
+    folder_name: Optional[str] = None,
     progress_callback: Optional[Callable[[str], None]] = None,
 ) -> dict:
     """
@@ -88,9 +108,15 @@ def run_batch_pipeline(
         return {"success": False, "share_url": "", "error": "没有有效的视频链接"}
 
     base_dir = Path(get_download_dir())
-    batch_dir = base_dir / f"batch_{task_id}"
+    safe = _safe_folder_name(folder_name or "")
+    if safe:
+        folder = f"{safe}_{_ts()}"
+        batch_dir = base_dir / folder
+        batch_name = folder
+    else:
+        batch_dir = base_dir / f"batch_{task_id}"
+        batch_name = f"视频批次_{task_id[:8]}"
     batch_dir.mkdir(parents=True, exist_ok=True)
-    batch_name = f"视频批次_{task_id[:8]}"
 
     downloaded: List[Path] = []
     try:

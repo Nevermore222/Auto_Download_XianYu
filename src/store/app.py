@@ -2,11 +2,14 @@
 客户自助网站：输入视频链接 → 查价 → 下单 → 获得夸克下载链接。
 定价按时长与分辨率；下单异步处理，支持轮询状态，便于负载均衡扩展。
 """
+import re
 import threading
 import uuid
 from contextlib import asynccontextmanager
+import io
+from typing import List
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
@@ -18,6 +21,26 @@ from src.pipeline.task import run_batch_pipeline, run_pipeline
 # 内存任务表：task_id -> { status, share_url?, error? }（可后续改为 Redis 做多机负载均衡）
 _task_store: dict = {}
 _store_lock = threading.Lock()
+
+
+_URL_RE = re.compile(r"(https?://\S+)")
+
+
+def _extract_urls(raw_list: list[str]) -> list[str]:
+    urls: list[str] = []
+    for raw in raw_list:
+        if not raw:
+            continue
+        for m in _URL_RE.finditer(raw):
+            # 使用第一个捕获组返回完整 URL
+            urls.append(m.group(1))
+    return urls
+
+
+def _extract_urls_from_text(text: str) -> list[str]:
+    if not text:
+        return []
+    return _extract_urls([text])
 
 
 def _calc_price(duration_seconds: int, height: int) -> tuple[float, list[str]]:
@@ -100,6 +123,7 @@ class QuoteBatchOut(BaseModel):
 class OrderIn(BaseModel):
     video_url: str | None = None  # 单条时可用
     video_urls: list[str] | None = None  # 多条时使用，与 video_url 二选一
+    folder_name: str | None = None  # 选填：若填写则创建“文件夹名_时间戳”作为批次目录与夸克文件夹名
 
 
 class OrderOut(BaseModel):
@@ -162,7 +186,8 @@ def quote(req: QuoteIn) -> QuoteOut:
 @app.post("/api/quote_batch", response_model=QuoteBatchOut)
 def quote_batch(req: QuoteBatchIn) -> QuoteBatchOut:
     """批量报价：多条链接统一返回每条信息与总价。"""
-    urls = [u.strip() for u in (req.video_urls or []) if u.strip()]
+    # 允许一行里包含标题+URL，这里自动从文本中提取出所有 URL
+    urls = _extract_urls(req.video_urls or [])
     if not urls:
         raise HTTPException(status_code=400, detail="请填写至少一条视频链接")
     items: list[QuoteItemOut] = []
@@ -187,7 +212,7 @@ def quote_batch(req: QuoteBatchIn) -> QuoteBatchOut:
     return QuoteBatchOut(items=items, total_price=round(total, 2), count=len(items))
 
 
-def _run_task(task_id: str, video_urls: list[str]) -> None:
+def _run_task(task_id: str, video_urls: list[str], folder_name: str | None = None) -> None:
     def progress_step(msg: str) -> None:
         with _store_lock:
             _task_store[task_id]["step"] = msg
@@ -196,7 +221,8 @@ def _run_task(task_id: str, video_urls: list[str]) -> None:
         _task_store[task_id]["status"] = "processing"
         _task_store[task_id]["step"] = "准备中…"
     try:
-        if len(video_urls) == 1:
+        # 若填写了 folder_name，则强制按批次模式：即使只有 1 条，也创建同名文件夹并分享文件夹链接
+        if (not (folder_name or "").strip()) and len(video_urls) == 1:
             result = run_pipeline(
                 video_urls[0],
                 skip_quark=False,
@@ -204,7 +230,7 @@ def _run_task(task_id: str, video_urls: list[str]) -> None:
                 progress_callback=progress_step,
             )
         else:
-            result = run_batch_pipeline(task_id, video_urls, progress_callback=progress_step)
+            result = run_batch_pipeline(task_id, video_urls, folder_name=folder_name, progress_callback=progress_step)
         with _store_lock:
             if result.get("success"):
                 _task_store[task_id]["status"] = "success"
@@ -225,18 +251,84 @@ def _run_task(task_id: str, video_urls: list[str]) -> None:
 def create_order(req: OrderIn) -> OrderOut:
     """提交订单（单条或批量），立即返回 task_id；批量时下载到同一文件夹、上传到夸克同一文件夹、生成一个分享链接。"""
     urls: list[str] = []
+    # 统一用 _extract_urls，从文本中提取 http/https 链接；支持“标题 + URL”格式
     if req.video_urls:
-        urls = [u.strip() for u in req.video_urls if u.strip()]
+        urls = _extract_urls(req.video_urls)
     if req.video_url and not urls:
-        urls = [req.video_url.strip()]
+        urls = _extract_urls([req.video_url])
     if not urls:
         raise HTTPException(status_code=400, detail="请填写至少一条视频链接")
     task_id = str(uuid.uuid4())
     with _store_lock:
         _task_store[task_id] = {"status": "pending", "step": None, "share_url": None, "error": None}
-    t = threading.Thread(target=_run_task, args=(task_id, urls), daemon=True)
+    t = threading.Thread(target=_run_task, args=(task_id, urls, req.folder_name), daemon=True)
     t.start()
     return OrderOut(task_id=task_id)
+
+
+@app.post("/api/extract_links")
+async def extract_links_from_file(file: UploadFile = File(...)) -> dict:
+    """
+    从上传的文档中提取所有 http/https 链接。
+    支持：
+    - 文本：.txt（utf-8/gbk 等，自动忽略无法解码字符）
+    - Word：.docx
+    - Excel：.xlsx
+    返回: { "urls": [ ... ] }
+    """
+    filename = (file.filename or "").lower()
+    content = await file.read()
+
+    urls: List[str] = []
+
+    try:
+        if filename.endswith(".txt") or not filename:
+            # 尝试多种常见编码解码文本
+            for enc in ("utf-8", "gbk", "gb2312"):
+                try:
+                    text = content.decode(enc, errors="ignore")
+                    break
+                except Exception:
+                    text = ""
+            urls = _extract_urls_from_text(text)
+        elif filename.endswith(".docx"):
+            from docx import Document
+
+            doc = Document(io.BytesIO(content))
+            parts: List[str] = []
+            for p in doc.paragraphs:
+                if p.text:
+                    parts.append(p.text)
+            text = "\n".join(parts)
+            urls = _extract_urls_from_text(text)
+        elif filename.endswith(".xlsx"):
+            import openpyxl
+            import io as _io
+
+            wb = openpyxl.load_workbook(_io.BytesIO(content), data_only=True)
+            parts: List[str] = []
+            for ws in wb.worksheets:
+                for row in ws.iter_rows(values_only=True):
+                    for cell in row:
+                        if isinstance(cell, str):
+                            parts.append(cell)
+            text = "\n".join(parts)
+            urls = _extract_urls_from_text(text)
+        else:
+            # 其他扩展名按文本尝试处理
+            text = content.decode("utf-8", errors="ignore")
+            urls = _extract_urls_from_text(text)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"解析文件失败: {e}")
+
+    # 去重，保持原顺序
+    seen = set()
+    uniq: List[str] = []
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            uniq.append(u)
+    return {"urls": uniq}
 
 
 @app.get("/api/order/{task_id}", response_model=OrderStatusOut)
@@ -381,6 +473,10 @@ _INDEX_HTML = """<!DOCTYPE html>
     <div class="card">
       <label for="video_urls">客户视频链接（每行一条，B站 / 抖音 / 等）</label>
       <textarea id="video_urls" placeholder="https://www.bilibili.com/video/...&#10;https://...&#10;（可粘贴多条）" autocomplete="off"></textarea>
+      <label for="file_input" style="margin-top:0.75rem;">或上传包含链接的文档（txt / docx / xlsx）</label>
+      <input type="file" id="file_input" accept=".txt,.docx,.xlsx">
+      <label for="folder_name" style="margin-top:0.75rem;">批次文件夹名（选填：填写后会自动追加时间戳，用于本地下载目录与夸克网盘文件夹名）</label>
+      <input type="text" id="folder_name" placeholder="例如：客户张三_订单123（不填则默认单文件）" autocomplete="off">
       <div class="row">
         <button type="button" class="btn btn-primary" id="btnQuote">查询价格（报给客户）</button>
         <button type="button" class="btn btn-secondary" id="btnOrder">提交并处理（下载→上传夸克→生成一个链接）</button>
@@ -409,8 +505,28 @@ _INDEX_HTML = """<!DOCTYPE html>
 
   <script>
     function getUrls() {
-      var text = document.getElementById('video_urls').value;
-      return text.split(/[\\r\\n]+/).map(function(s) { return s.trim(); }).filter(Boolean);
+      var text = document.getElementById('video_urls').value || '';
+      // 保守实现：先把换行统一成 \\n，再按空白拆分取 URL
+      text = text.replaceAll('\\r\\n', '\\n').replaceAll('\\r', '\\n');
+      // 再按空白字符切分（这里不用正则，逐层 split 合并即可）
+      var parts = [];
+      text.split('\\n').forEach(function(line) {
+        (line || '').split('\\t').forEach(function(seg) {
+          (seg || '').split(' ').forEach(function(tok) {
+            tok = (tok || '').trim();
+            if (tok) parts.push(tok);
+          });
+        });
+      });
+      var urls = [];
+      parts.forEach(function(p) {
+        p = (p || '').trim();
+        if (!p) return;
+        if (p.indexOf('http://') === 0 || p.indexOf('https://') === 0) {
+          urls.push(p);
+        }
+      });
+      return urls;
     }
 
     function showQuoteBatch(data) {
@@ -486,25 +602,92 @@ _INDEX_HTML = """<!DOCTYPE html>
       var urls = getUrls();
       if (!urls.length) { alert('请先输入至少一条视频链接（每行一条）'); return; }
       this.disabled = true;
+      // 先给出可见反馈，避免“无反应”的感觉
+      document.getElementById('outQuote').classList.remove('hidden');
+      document.getElementById('quoteTitle').textContent = '正在查询价格…';
+      document.getElementById('quoteBatchList').innerHTML = '';
+      document.getElementById('quoteTotal').textContent = '';
+      document.getElementById('quoteErr').classList.add('hidden');
+
+      var ctrl = (window.AbortController ? new AbortController() : null);
+      var timer = ctrl ? setTimeout(function(){ ctrl.abort(); }, 30000) : null; // 30s 超时提示
       fetch('/api/quote_batch', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ video_urls: urls })
+        body: JSON.stringify({ video_urls: urls }),
+        signal: ctrl ? ctrl.signal : undefined
+      })
+        .then(function(r) {
+          if (!r.ok) {
+            return r.text().then(function(t){ throw new Error(t || ('HTTP ' + r.status)); });
+          }
+          return r.json();
+        })
+        .then(function(d) { showQuoteBatch(d); })
+        .catch(function(e) {
+          showQuoteBatch({ items: [], total_price: 0, count: 0 });
+          var msg = (e && e.name === 'AbortError') ? '查询超时（30秒）。可能链接解析较慢/网络不通，建议分批查询或稍后重试。' : (e.message || '网络错误');
+          document.getElementById('quoteErr').textContent = msg;
+          document.getElementById('quoteErr').classList.remove('hidden');
+        })
+        .finally(function() {
+          if (timer) clearTimeout(timer);
+          document.getElementById('btnQuote').disabled = false;
+        });
+    };
+
+    // 从文档中识别链接并填充到文本框
+    document.getElementById('file_input').addEventListener('change', function(e) {
+      var file = e.target.files[0];
+      if (!file) return;
+      var formData = new FormData();
+      formData.append('file', file);
+      fetch('/api/extract_links', {
+        method: 'POST',
+        body: formData
       })
         .then(function(r) { return r.json(); })
-        .then(function(d) { showQuoteBatch(d); })
-        .catch(function(e) { showQuoteBatch({ items: [], total_price: 0, count: 0 }); document.getElementById('quoteErr').textContent = e.message || '网络错误'; document.getElementById('quoteErr').classList.remove('hidden'); })
-        .finally(function() { document.getElementById('btnQuote').disabled = false; });
-    };
+        .then(function(d) {
+          if (!d || !d.urls || !d.urls.length) {
+            alert('未在文档中识别到链接');
+            return;
+          }
+          var textarea = document.getElementById('video_urls');
+          // 先统一换行再拆分
+          var existingText = (textarea.value || '').replaceAll('\\r\\n', '\\n').replaceAll('\\r', '\\n');
+          var existing = existingText ? existingText.split('\\n') : [];
+          var all = existing.concat(d.urls);
+          // 去重
+          var seen = {};
+          var lines = [];
+          all.forEach(function(u) {
+            u = (u || '').trim();
+            if (!u) return;
+            if (!seen[u]) {
+              seen[u] = true;
+              lines.push(u);
+            }
+          });
+          textarea.value = lines.join('\\n');
+          alert('已从文档识别并填入 ' + d.urls.length + ' 条链接');
+        })
+        .catch(function(err) {
+          alert('解析文档失败：' + (err.message || err));
+        })
+        .finally(function() {
+          e.target.value = '';
+        });
+    });
 
     document.getElementById('btnOrder').onclick = function() {
       var urls = getUrls();
       if (!urls.length) { alert('请先输入至少一条视频链接（每行一条）'); return; }
       this.disabled = true;
+      var folderName = (document.getElementById('folder_name').value || '').trim();
       fetch('/api/order', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ video_urls: urls })
+        body: JSON.stringify({ video_urls: urls, folder_name: folderName || null })
       })
         .then(function(r) { return r.json(); })
         .then(function(d) {
@@ -530,9 +713,10 @@ _INDEX_HTML = """<!DOCTYPE html>
 
 def main():
     import uvicorn
+    import os
     cfg = load_config().get("store", {})
-    host = cfg.get("host", "0.0.0.0")
-    port = int(cfg.get("port", 8770))
+    host = os.getenv("STORE_HOST") or cfg.get("host", "0.0.0.0")
+    port = int(os.getenv("STORE_PORT") or cfg.get("port", 8770))
     uvicorn.run(app, host=host, port=port)
 
 

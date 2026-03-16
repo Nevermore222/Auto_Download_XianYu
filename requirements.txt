@@ -4,10 +4,15 @@ yt-dlp>=2024.1.1
 # Web 与 API
 fastapi>=0.109.0
 uvicorn[standard]>=0.27.0
+python-multipart>=0.0.9
 
 # 配置与工具
 pyyaml>=6.0
 requests>=2.31.0
+
+# 文档解析（卖家工作台上传 txt/docx/xlsx 提取链接）
+python-docx>=1.1.0
+openpyxl>=3.1.0
 
 # 可选：闲鱼/夸克第三方库（按需安装）
 # selenium  # 若用浏览器自动获取夸克 Cookie

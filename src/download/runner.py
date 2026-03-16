@@ -12,11 +12,16 @@ def get_video_info(video_url: str) -> dict[str, Any]:
     仅拉取视频元数据（不下载），用于报价。
     返回: { "duration": 秒数, "height": 分辨率高度(px), "title": 标题, "ok": True } 或 { "ok": False, "error": "..." }
     """
+    cfg = load_config().get("download", {})
+    info_timeout = int(cfg.get("info_timeout_seconds", 15))
     ydl_opts = {
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
         "extract_flat": False,
+        # 避免解析卡死太久（手机端/短链/部分站点可能超时）
+        "socket_timeout": info_timeout,
+        "retries": 1,
     }
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
