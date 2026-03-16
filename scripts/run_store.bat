@@ -10,7 +10,12 @@ REM 启动前：自动杀掉占用端口的残留进程（避免 Errno 10048）
 set "STORE_PORT_EFFECTIVE=%STORE_PORT%"
 if "%STORE_PORT_EFFECTIVE%"=="" set "STORE_PORT_EFFECTIVE=8770"
 echo [INFO] 检查端口占用：%STORE_PORT_EFFECTIVE%
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$p = [int]$env:STORE_PORT_EFFECTIVE; $pids = @(); try { $pids = (Get-NetTCPConnection -LocalPort $p -State Listen -ErrorAction Stop | Select-Object -ExpandProperty OwningProcess -Unique) } catch { $pids = (netstat -ano | Select-String (':'+$p+'\\s') | ForEach-Object { ($_.ToString() -split '\\s+')[-1] } | Sort-Object -Unique) }; foreach ($pid in $pids) { if ($pid -and $pid -ne 0) { try { Stop-Process -Id $pid -Force -ErrorAction Stop; Write-Host (\"[INFO] 已结束占用端口的进程 PID=${pid}\") } catch { Write-Host (\"[WARN] 结束进程失败 PID=${pid}: $($_.Exception.Message)\") } } }"
+for /f "tokens=5" %%P in ('netstat -ano ^| findstr /R /C:":%STORE_PORT_EFFECTIVE% .*LISTENING"') do (
+  if not "%%P"=="0" (
+    echo [INFO] 发现占用端口的进程 PID=%%P，正在结束...
+    taskkill /F /PID %%P >nul 2>nul
+  )
+)
 
 python -m src.store.app
 if errorlevel 1 (

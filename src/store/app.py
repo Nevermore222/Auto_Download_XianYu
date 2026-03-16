@@ -14,7 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
-from src.common.config import load_config
+from src.common.config import load_config, save_config, set_cfg_value
 from src.download.runner import get_video_info
 from src.pipeline.task import run_batch_pipeline, run_pipeline
 
@@ -135,6 +135,39 @@ class OrderStatusOut(BaseModel):
     step: str | None = None  # 当前步骤说明，便于显示进度日志
     share_url: str | None = None
     error: str | None = None
+
+
+class WebConfigOut(BaseModel):
+    quark_cookie: str
+    douyin_cookie: str
+
+
+class WebConfigIn(BaseModel):
+    quark_cookie: str | None = None
+    douyin_cookie: str | None = None
+
+
+@app.get("/api/config", response_model=WebConfigOut)
+def get_web_config() -> WebConfigOut:
+    cfg = load_config() or {}
+    return WebConfigOut(
+        quark_cookie=(cfg.get("quark", {}) or {}).get("cookie", "") or "",
+        douyin_cookie=(cfg.get("download", {}) or {}).get("douyin_cookie", "") or "",
+    )
+
+
+@app.post("/api/config", response_model=WebConfigOut)
+def save_web_config(req: WebConfigIn) -> WebConfigOut:
+    cfg = load_config() or {}
+    if req.quark_cookie is not None:
+        set_cfg_value(cfg, ["quark", "cookie"], (req.quark_cookie or "").strip())
+    if req.douyin_cookie is not None:
+        set_cfg_value(cfg, ["download", "douyin_cookie"], (req.douyin_cookie or "").strip())
+    save_config(cfg)
+    return WebConfigOut(
+        quark_cookie=(cfg.get("quark", {}) or {}).get("cookie", "") or "",
+        douyin_cookie=(cfg.get("download", {}) or {}).get("douyin_cookie", "") or "",
+    )
 
 
 def _format_duration(sec: int) -> str:
@@ -458,6 +491,9 @@ _INDEX_HTML = """<!DOCTYPE html>
     .err-msg { color: var(--err); font-size: 0.9rem; margin-top: 0.5rem; }
     .hidden { display: none !important; }
     #outQuote, #outOrder, #outResult { margin-top: 0.75rem; }
+    .mini { font-size: 0.8rem; color: var(--muted); line-height: 1.5; }
+    .cfg-actions { display: flex; gap: 0.5rem; margin-top: 0.75rem; }
+    .cfg-actions .btn { flex: 1; }
     @media (max-width: 400px) {
       body { padding: 0.75rem; }
       .card { padding: 1rem; }
@@ -481,6 +517,20 @@ _INDEX_HTML = """<!DOCTYPE html>
         <button type="button" class="btn btn-primary" id="btnQuote">查询价格（报给客户）</button>
         <button type="button" class="btn btn-secondary" id="btnOrder">提交并处理（下载→上传夸克→生成一个链接）</button>
       </div>
+    </div>
+
+    <div class="card">
+      <div style="font-weight:700;">Cookie 配置（保存后立即生效）</div>
+      <div class="mini">抖音近期开启了 Cookie 校验：若查询价格提示需要 Fresh cookies，请在此粘贴浏览器里复制的 Cookie 字符串。</div>
+      <label for="cfg_quark_cookie" style="margin-top:0.75rem;">夸克 Cookie（用于上传与生成分享链接）</label>
+      <textarea id="cfg_quark_cookie" placeholder="粘贴完整 Cookie（如 __puus=...; ...）" autocomplete="off" style="min-height:86px;"></textarea>
+      <label for="cfg_douyin_cookie" style="margin-top:0.75rem;">抖音 Cookie（用于解析抖音链接报价/下载）</label>
+      <textarea id="cfg_douyin_cookie" placeholder="粘贴抖音网页版 Cookie（不一定要登录，但需要新鲜）" autocomplete="off" style="min-height:86px;"></textarea>
+      <div class="cfg-actions">
+        <button type="button" class="btn btn-secondary" id="btnCfgReload">读取当前配置</button>
+        <button type="button" class="btn btn-primary" id="btnCfgSave">保存配置</button>
+      </div>
+      <div class="err-msg hidden" id="cfgMsg"></div>
     </div>
 
     <div id="outQuote" class="card quote-card hidden">
@@ -635,6 +685,67 @@ _INDEX_HTML = """<!DOCTYPE html>
           document.getElementById('btnQuote').disabled = false;
         });
     };
+
+    function setCfgMsg(text, isErr) {
+      var el = document.getElementById('cfgMsg');
+      if (!text) { el.classList.add('hidden'); el.textContent = ''; return; }
+      el.textContent = text;
+      el.classList.remove('hidden');
+      el.style.color = isErr ? 'var(--err)' : 'var(--success)';
+    }
+
+    function reloadConfig() {
+      setCfgMsg('正在读取配置…', false);
+      return fetch('/api/config')
+        .then(function(r) {
+          if (!r.ok) {
+            return r.text().then(function(t){ throw new Error(t || ('HTTP ' + r.status)); });
+          }
+          return r.json();
+        })
+        .then(function(d) {
+          document.getElementById('cfg_quark_cookie').value = (d.quark_cookie || '');
+          document.getElementById('cfg_douyin_cookie').value = (d.douyin_cookie || '');
+          setCfgMsg('已读取当前配置。', false);
+        })
+        .catch(function(e) {
+          setCfgMsg('读取配置失败：' + (e.message || e), true);
+        });
+    }
+
+    document.getElementById('btnCfgReload').onclick = function() {
+      reloadConfig();
+    };
+
+    document.getElementById('btnCfgSave').onclick = function() {
+      var quark = (document.getElementById('cfg_quark_cookie').value || '').trim();
+      var douyin = (document.getElementById('cfg_douyin_cookie').value || '').trim();
+      setCfgMsg('正在保存…', false);
+      this.disabled = true;
+      fetch('/api/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ quark_cookie: quark, douyin_cookie: douyin })
+      })
+        .then(function(r) {
+          if (!r.ok) {
+            return r.text().then(function(t){ throw new Error(t || ('HTTP ' + r.status)); });
+          }
+          return r.json();
+        })
+        .then(function() {
+          setCfgMsg('保存成功，已生效。', false);
+        })
+        .catch(function(e) {
+          setCfgMsg('保存失败：' + (e.message || e), true);
+        })
+        .finally(function() {
+          document.getElementById('btnCfgSave').disabled = false;
+        });
+    };
+
+    // 页面加载时自动拉取一次配置
+    reloadConfig();
 
     // 从文档中识别链接并填充到文本框
     document.getElementById('file_input').addEventListener('change', function(e) {

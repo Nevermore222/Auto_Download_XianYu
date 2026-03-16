@@ -7,6 +7,8 @@ download:
   # 下载格式：best 或 bestvideo+bestaudio
   format: "bestvideo+bestaudio/best"
   merge_format: "mp4"
+  # 抖音 Cookie（抖音近期开启了 Cookie 校验：需要较“新鲜”的 Cookie 才能解析链接。可在卖家工作台页面配置保存）
+  douyin_cookie: ""
   # 可选：按站点传参给 yt-dlp（如 B 站）。B 站水印多为压进画面，下载即带水印；若 yt-dlp 后续支持可在此配置
   # extractor_args:
   #   bilibili: {}
